@@ -924,6 +924,9 @@ while True:
                     print("Script execution stopping...")
                     break
 
+        if advanced_settings["max_trajectories"] is not False and trajectory_n >= advanced_settings["max_trajectories"]:
+            break
+
         # increase trajectory number
         trajectory_n += 1
         
