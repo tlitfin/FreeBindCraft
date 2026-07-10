@@ -53,7 +53,11 @@ def score_interface(pdb_file, binder_chain="B", use_pyrosetta=True):
 
     # analyze interface statistics
     iam = InterfaceAnalyzerMover()
-    iam.set_interface("A_B")
+    interface = "A_B"
+    docking_partners_type = getattr(pr.rosetta.core.pose, "DockingPartners", None)
+    if docking_partners_type is not None:
+        interface = docking_partners_type.docking_partners_from_string(interface)
+    iam.set_interface(interface)
     scorefxn = pr.get_fa_scorefxn()
     iam.set_scorefunction(scorefxn)
     iam.set_compute_packstat(True)
@@ -321,4 +325,3 @@ def pr_relax(pdb_file, relaxed_pdb_path, use_pyrosetta=True):
         openmm_gpu = True # Default to True for GPU usage in OpenMM fallback
         # Run OpenMM relax in a fresh subprocess to fully reset OpenCL context per run
         alt.openmm_relax_subprocess(pdb_file, relaxed_pdb_path, use_gpu_relax=openmm_gpu)
-        
