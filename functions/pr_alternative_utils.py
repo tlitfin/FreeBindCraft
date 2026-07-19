@@ -1153,6 +1153,13 @@ def openmm_relax(pdb_file_path, output_pdb_path, use_gpu_relax=True,
         
         simulation.context.setPositions(fixer.positions)
 
+        # Log initial (pre-minimisation) energy
+        try:
+            _e_initial = simulation.context.getState(getEnergy=True).getPotentialEnergy()
+            print(f"[OpenMM-Relax] {basename}  Initial energy (post-PDBFixer, pre-min): {_e_initial.value_in_unit(unit.kilojoule_per_mole):.2f} kJ/mol")
+        except Exception:
+            pass
+
         # Optional Pre-Minimization Step (before main ramp loop)
         # Perform if restraints or LJ repulsion are active, to stabilize structure.
         if restraint_k_kcal_mol_A2 > 0 or lj_rep_base_k_kj_mol > 0:
@@ -1170,11 +1177,17 @@ def openmm_relax(pdb_file_path, output_pdb_path, use_gpu_relax=True,
                 restraint_force.setGlobalParameterDefaultValue(k_restraint_param_index, full_initial_restraint_k_val)
                 restraint_force.updateParametersInContext(simulation.context)
             
+            print(f"[OpenMM-Relax] {basename}  Pre-ramp minimisation (full restraint, LJ-rep=0, tol={openmm_ramp_force_tolerance_kj_mol_nm} kJ/mol/nm, max_iter={openmm_max_iterations})")
             initial_min_tolerance = openmm_ramp_force_tolerance_kj_mol_nm * unit.kilojoule_per_mole / unit.nanometer
             simulation.minimizeEnergy(
                 tolerance=initial_min_tolerance,
                 maxIterations=openmm_max_iterations 
             )
+            try:
+                _e_post_init = simulation.context.getState(getEnergy=True).getPotentialEnergy()
+                print(f"[OpenMM-Relax] {basename}  Pre-ramp minimisation complete: {_e_post_init.value_in_unit(unit.kilojoule_per_mole):.2f} kJ/mol ({time.time()-t_init_min_start:.1f}s)")
+            except Exception:
+                pass
             if _perf is not None:
                 _perf["initial_min_seconds"] = time.time() - t_init_min_start
 
@@ -1200,6 +1213,10 @@ def openmm_relax(pdb_file_path, output_pdb_path, use_gpu_relax=True,
         if num_stages == 1 and effective_restraint_factors == [0.0] and effective_lj_rep_factors == [0.0] and not (restraint_k_kcal_mol_A2 > 0 or lj_rep_base_k_kj_mol > 0):
             pass
 
+        print(f"[OpenMM-Relax] {basename}  Starting {num_stages}-stage ramp (restraint factors={list(effective_restraint_factors)}, LJ-rep factors={list(effective_lj_rep_factors)})")
+        print(f"[OpenMM-Relax] {basename}  Note: accept-to-best compares physical energy only (groups 0+1, LJ-rep excluded)")
+        best_stage_num = None  # Track which stage produced the best (lowest) energy
+
         for i_stage_val, (k_factor_restraint, current_lj_rep_k_factor) in enumerate(ramp_pairs):
             stage_num = i_stage_val + 1
             _stage_metrics = None
@@ -1218,13 +1235,32 @@ def openmm_relax(pdb_file_path, output_pdb_path, use_gpu_relax=True,
                     "final_energy_kj": None,
                 }
 
+            # Restore best-known positions at the start of every stage after the first.
+            # Without this, a rejected stage (e.g. MD shake degraded structure) passes its
+            # degraded geometry to the next stage, which then minimises from a sub-optimal
+            # starting point rather than from the current best geometry.
+            if i_stage_val > 0 and best_positions is not None:
+                simulation.context.setPositions(best_positions)
+                vprint(f"[OpenMM-Relax] {basename}  Stage {stage_num}: reset to best positions from stage {best_stage_num}")
+
             # Record starting energy for this stage
+            _stage_energy_start = None
             try:
                 _stage_energy_start = simulation.context.getState(getEnergy=True).getPotentialEnergy()
                 if _stage_metrics is not None:
                     _stage_metrics["energy_start_kj"] = float(_stage_energy_start.value_in_unit(unit.kilojoule_per_mole))
             except Exception:
                 pass
+
+            # Print stage header with parameters and starting energy
+            _k_restraint_eff = restraint_k_kcal_mol_A2 * k_factor_restraint
+            _k_lj_eff = lj_rep_base_k_kj_mol * current_lj_rep_k_factor
+            _e_start_str = f"{_stage_energy_start.value_in_unit(unit.kilojoule_per_mole):.2f} kJ/mol" if _stage_energy_start is not None else "N/A"
+            _tol_str = openmm_final_force_tolerance_kj_mol_nm if i_stage_val == num_stages - 1 else openmm_ramp_force_tolerance_kj_mol_nm
+            print(f"[OpenMM-Relax] {basename}  Stage {stage_num}/{num_stages}: "
+                  f"restraint_k={_k_restraint_eff:.3f} kcal/mol/A2, "
+                  f"LJ-rep_k={_k_lj_eff:.2f} kJ/mol, "
+                  f"tol={_tol_str} kJ/mol/nm  |  start_E={_e_start_str}")
 
             # Set LJ repulsive ramp for the current stage
             if lj_rep_custom_force is not None and k_rep_lj_param_index != -1 and lj_rep_base_k_kj_mol > 0:
@@ -1242,16 +1278,21 @@ def openmm_relax(pdb_file_path, output_pdb_path, use_gpu_relax=True,
             # MD Shake only for first two ramp stages for speed-performance tradeoff
             if md_steps_per_shake > 0 and i_stage_val < 2:
                 t_md_start = time.time()
+                vprint(f"[OpenMM-Relax] {basename}  Stage {stage_num}: running {md_steps_per_shake}-step MD shake...")
                 simulation.context.setVelocitiesToTemperature(300*unit.kelvin) # Reinitialize velocities
                 simulation.step(md_steps_per_shake)
-                if _stage_metrics is not None:
-                    _stage_metrics["md_steps_run"] = int(md_steps_per_shake)
-                    _stage_metrics["md_seconds"] = time.time() - t_md_start
-                    try:
-                        _md_energy = simulation.context.getState(getEnergy=True).getPotentialEnergy()
-                        _stage_metrics["md_post_energy_kj"] = float(_md_energy.value_in_unit(unit.kilojoule_per_mole))
-                    except Exception:
-                        pass
+                try:
+                    _md_energy = simulation.context.getState(getEnergy=True).getPotentialEnergy()
+                    _md_e_val = _md_energy.value_in_unit(unit.kilojoule_per_mole)
+                    print(f"[OpenMM-Relax] {basename}  Stage {stage_num}: post-MD-shake E={_md_e_val:.2f} kJ/mol ({time.time()-t_md_start:.1f}s)")
+                    if _stage_metrics is not None:
+                        _stage_metrics["md_steps_run"] = int(md_steps_per_shake)
+                        _stage_metrics["md_seconds"] = time.time() - t_md_start
+                        _stage_metrics["md_post_energy_kj"] = float(_md_e_val)
+                except Exception:
+                    if _stage_metrics is not None:
+                        _stage_metrics["md_steps_run"] = int(md_steps_per_shake)
+                        _stage_metrics["md_seconds"] = time.time() - t_md_start
 
             # Minimization for the current stage
             # Set force tolerance for current stage
@@ -1269,24 +1310,30 @@ def openmm_relax(pdb_file_path, output_pdb_path, use_gpu_relax=True,
             last_energy = simulation.context.getState(getEnergy=True).getPotentialEnergy()
 
             t_min_start = time.time()
+            _min_chunk_num = 0
             while True:
+                _min_chunk_num += 1
                 simulation.minimizeEnergy(tolerance=force_tolerance_quantity,
                                           maxIterations=per_call_max_iterations)
                 current_energy = simulation.context.getState(getEnergy=True).getPotentialEnergy()
+                _cur_e_val = current_energy.value_in_unit(unit.kilojoule_per_mole)
                 if _stage_metrics is not None:
                     _stage_metrics["min_calls"] += 1
                     try:
-                        _stage_metrics["min_energy_trace_kj"].append(float(current_energy.value_in_unit(unit.kilojoule_per_mole)))
+                        _stage_metrics["min_energy_trace_kj"].append(float(_cur_e_val))
                     except Exception:
                         pass
 
                 # Check improvement magnitude
                 try:
                     energy_improvement = last_energy - current_energy
+                    _improvement_val = energy_improvement.value_in_unit(unit.kilojoule_per_mole)
                     if energy_improvement < (0.1 * unit.kilojoule_per_mole):
                         small_improvement_streak += 1
+                        vprint(f"[OpenMM-Relax] {basename}  Stage {stage_num} chunk {_min_chunk_num}: E={_cur_e_val:.2f} kJ/mol, improvement={_improvement_val:.4f} kJ/mol (streak={small_improvement_streak})")
                     else:
                         small_improvement_streak = 0
+                        vprint(f"[OpenMM-Relax] {basename}  Stage {stage_num} chunk {_min_chunk_num}: E={_cur_e_val:.2f} kJ/mol, improvement={_improvement_val:.4f} kJ/mol")
                 except Exception:
                     # If unit math fails for any reason, break conservatively
                     small_improvement_streak = 3
@@ -1297,29 +1344,52 @@ def openmm_relax(pdb_file_path, output_pdb_path, use_gpu_relax=True,
                 if openmm_max_iterations > 0:
                     remaining_iterations -= per_call_max_iterations
                     if remaining_iterations <= 0:
+                        vprint(f"[OpenMM-Relax] {basename}  Stage {stage_num}: iteration cap reached after {_min_chunk_num} chunks")
                         break
 
                 # Early stop if improvement is consistently negligible
                 if small_improvement_streak >= 3:
+                    vprint(f"[OpenMM-Relax] {basename}  Stage {stage_num}: early stop after {_min_chunk_num} chunks (negligible improvement)")
                     break
 
             stage_final_energy = last_energy
+            _stage_final_e_val = None
+            try:
+                _stage_final_e_val = stage_final_energy.value_in_unit(unit.kilojoule_per_mole)
+            except Exception:
+                pass
             if _stage_metrics is not None:
-                try:
-                    _stage_metrics["final_energy_kj"] = float(stage_final_energy.value_in_unit(unit.kilojoule_per_mole))
-                except Exception:
-                    _stage_metrics["final_energy_kj"] = None
+                _stage_metrics["final_energy_kj"] = _stage_final_e_val
                 _stage_metrics["min_seconds"] = time.time() - t_min_start
                 _perf["stages"].append(_stage_metrics)
 
-            # Accept-to-best bookkeeping
-            if stage_final_energy < best_energy:
-                best_energy = stage_final_energy 
+            # Accept-to-best bookkeeping: compare physical energy only (groups 0+1),
+            # excluding the custom LJ-repulsion (group 2) whose strength varies per stage.
+            # This ensures a fair comparison across stages with different LJ-rep ramp values.
+            try:
+                _phys_state = simulation.context.getState(getEnergy=True, groups={0, 1})
+                stage_physical_energy = _phys_state.getPotentialEnergy()
+                _phys_e_val = stage_physical_energy.value_in_unit(unit.kilojoule_per_mole)
+            except Exception:
+                # Fallback to total energy if group query fails
+                stage_physical_energy = stage_final_energy
+                _phys_e_val = _stage_final_e_val
+
+            if stage_physical_energy < best_energy:
+                best_energy = stage_physical_energy
                 best_positions = simulation.context.getState(getPositions=True).getPositions(asNumpy=True) # Use asNumpy=True
+                best_stage_num = stage_num
+                _phys_str = f"{_phys_e_val:.2f}" if _phys_e_val is not None else "N/A"
+                print(f"[OpenMM-Relax] {basename}  Stage {stage_num}/{num_stages}: ACCEPTED as new best  E={_phys_str} kJ/mol ({time.time()-t_min_start:.1f}s min)")
+            else:
+                _prev_best_str = f"{best_energy.value_in_unit(unit.kilojoule_per_mole):.2f}" if best_energy != float('inf') * unit.kilojoule_per_mole else "inf"
+                _phys_str = f"{_phys_e_val:.2f}" if _phys_e_val is not None else "N/A"
+                print(f"[OpenMM-Relax] {basename}  Stage {stage_num}/{num_stages}: REJECTED (E={_phys_str} >= best={_prev_best_str} kJ/mol); keeping stage {best_stage_num}")
 
         # After all stages, set positions to the best ones found
         if best_positions is not None:
             simulation.context.setPositions(best_positions)
+            print(f"[OpenMM-Relax] {basename}  All stages complete. Restoring positions from stage {best_stage_num} (best E={best_energy.value_in_unit(unit.kilojoule_per_mole):.2f} kJ/mol)")
 
         # 4. Save the relaxed structure
         t_save_start = time.time()
